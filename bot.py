@@ -10,7 +10,7 @@ from typing import Iterable
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
-from telegram import Document, Update
+from telegram import Document, ReplyKeyboardMarkup, Update
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from zoneinfo import ZoneInfo
 
@@ -23,6 +23,7 @@ DATE_RE = re.compile(r"^(\d{1,2})\.(\d{1,2})$")
 HEADERS = ("ФИО", "Дата")
 DATA_FILE = Path(os.getenv("DATA_FILE", "data/birthdays.xlsx"))
 STATE_FILE = Path(os.getenv("STATE_FILE", "data/sent_notifications.json"))
+ADMIN_STATE_FILE = Path(os.getenv("ADMIN_STATE_FILE", "data/admin_ids.json"))
 TIMEZONE = ZoneInfo(os.getenv("TIMEZONE", "Europe/Moscow"))
 REMINDER_TIME = os.getenv("REMINDER_TIME", "09:00")
 
@@ -33,6 +34,44 @@ def parse_admin_ids() -> set[int]:
 
 
 ADMIN_IDS = parse_admin_ids()
+MAIN_MENU = ReplyKeyboardMarkup(
+    [
+        ["Загрузить файл", "Выгрузить файл"],
+        ["Просмотреть таблицу"],
+        ["Добавить админа", "Удалить админа"],
+        ["Главное меню"],
+    ],
+    resize_keyboard=True,
+)
+STATE_UPLOAD = "upload"
+STATE_ADD_ADMIN = "add_admin"
+STATE_REMOVE_ADMIN = "remove_admin"
+
+
+def load_admin_ids() -> set[int]:
+    if ADMIN_STATE_FILE.exists():
+        return set(int(item) for item in json.loads(ADMIN_STATE_FILE.read_text(encoding="utf-8")))
+    return set(ADMIN_IDS)
+
+
+def save_admin_ids(admin_ids: set[int]) -> None:
+    ADMIN_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    ADMIN_STATE_FILE.write_text(json.dumps(sorted(admin_ids), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def get_admin_ids() -> set[int]:
+    return load_admin_ids()
+
+
+def set_user_state(context: ContextTypes.DEFAULT_TYPE, state: str | None) -> None:
+    if state is None:
+        context.user_data.pop("state", None)
+    else:
+        context.user_data["state"] = state
+
+
+async def show_main_menu(update: Update, text: str = "Главное меню") -> None:
+    await update.effective_message.reply_text(text, reply_markup=MAIN_MENU)
 
 
 def ensure_data_file() -> None:
@@ -114,7 +153,7 @@ def save_sent_state(state: set[str]) -> None:
 
 def is_allowed(update: Update) -> bool:
     user = update.effective_user
-    return bool(user and user.id in ADMIN_IDS)
+    return bool(user and user.id in get_admin_ids())
 
 
 def restricted(handler):
@@ -123,29 +162,90 @@ def restricted(handler):
             user_id = update.effective_user.id if update.effective_user else "unknown"
             LOGGER.warning("Denied access for Telegram ID %s", user_id)
             if update.effective_message:
-                await update.effective_message.reply_text(f"Нет доступа. Ваш Telegram ID: {user_id}")
+                await update.effective_message.reply_text("для доступа обратись к @ioibrieb")
             return
         await handler(update, context)
     return wrapper
 
 
-HELP_TEXT = """Команды:
-/start или /help — справка
-/upload — как загрузить Excel
-/export — выгрузить текущую таблицу
-/list — показать дни рождения текстом
-
-Чтобы обновить таблицу, просто отправьте .xlsx файл с двумя столбцами: ФИО и Дата."""
+MENU_TEXT = "Выберите действие."
 
 
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text(HELP_TEXT)
+    set_user_state(context, None)
+    await show_main_menu(update, MENU_TEXT)
 
 
 @restricted
-async def upload_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    await update.effective_message.reply_text("Отправьте .xlsx файл с заголовками 'ФИО' и 'Дата'. Дата: ДД.ММ, например 25.10.")
+async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    text = (update.effective_message.text or "").strip()
+    state = context.user_data.get("state")
+
+    if text == "Главное меню":
+        set_user_state(context, None)
+        await show_main_menu(update)
+        return
+
+    if state == STATE_ADD_ADMIN:
+        await add_admin(update, context, text)
+        return
+
+    if state == STATE_REMOVE_ADMIN:
+        await remove_admin(update, context, text)
+        return
+
+    if text == "Загрузить файл":
+        set_user_state(context, STATE_UPLOAD)
+        await show_main_menu(update, "Загрузите .xlsx файл.")
+    elif text == "Выгрузить файл":
+        await export_table(update, context)
+    elif text == "Просмотреть таблицу":
+        await list_birthdays(update, context)
+    elif text == "Добавить админа":
+        set_user_state(context, STATE_ADD_ADMIN)
+        await show_main_menu(update, "Введите Telegram ID.")
+    elif text == "Удалить админа":
+        set_user_state(context, STATE_REMOVE_ADMIN)
+        admins = ", ".join(str(item) for item in sorted(get_admin_ids()))
+        await show_main_menu(update, f"Введите Telegram ID. Сейчас: {admins}")
+    else:
+        await show_main_menu(update, MENU_TEXT)
+
+
+async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    try:
+        admin_id = int(text)
+    except ValueError:
+        await show_main_menu(update, "Нужен Telegram ID числом.")
+        return
+
+    admin_ids = get_admin_ids()
+    admin_ids.add(admin_id)
+    save_admin_ids(admin_ids)
+    set_user_state(context, None)
+    await show_main_menu(update, f"Админ добавлен: {admin_id}")
+
+
+async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
+    try:
+        admin_id = int(text)
+    except ValueError:
+        await show_main_menu(update, "Нужен Telegram ID числом.")
+        return
+
+    admin_ids = get_admin_ids()
+    if admin_id not in admin_ids:
+        await show_main_menu(update, f"Админ не найден: {admin_id}")
+        return
+    if len(admin_ids) == 1:
+        await show_main_menu(update, "Нельзя удалить последнего админа.")
+        return
+
+    admin_ids.remove(admin_id)
+    save_admin_ids(admin_ids)
+    set_user_state(context, None)
+    await show_main_menu(update, f"Админ удален: {admin_id}")
 
 
 @restricted
@@ -159,17 +259,22 @@ async def list_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ensure_data_file()
     rows = read_birthdays()
     if not rows:
-        await update.effective_message.reply_text("Таблица пока пустая.")
+        await update.effective_message.reply_text("Таблица пустая.", reply_markup=MAIN_MENU)
         return
     text = "\n".join(f"{item['name']} — {item['birthday']}" for item in rows)
-    await update.effective_message.reply_text(text[:4000])
+    await update.effective_message.reply_text(text[:4000], reply_markup=MAIN_MENU)
 
 
 @restricted
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    state = context.user_data.get("state")
+    if state != STATE_UPLOAD:
+        await show_main_menu(update, "Нажмите «Загрузить файл».")
+        return
+
     document: Document = update.effective_message.document
     if not document.file_name.lower().endswith(".xlsx"):
-        await update.effective_message.reply_text("Нужен файл в формате .xlsx")
+        await show_main_menu(update, "Нужен .xlsx файл.")
         return
 
     telegram_file = await document.get_file()
@@ -178,10 +283,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             rows = read_birthdays(Path(tmp.name))
         except Exception as exc:
-            await update.effective_message.reply_text(f"Не удалось загрузить таблицу: {exc}")
+            await show_main_menu(update, f"Ошибка: {exc}")
             return
     save_birthdays(rows)
-    await update.effective_message.reply_text(f"Таблица обновлена. Записей: {len(rows)}")
+    set_user_state(context, None)
+    await show_main_menu(update, f"Таблица обновлена. Записей: {len(rows)}")
 
 
 def date_for_year(day: int, month: int, year: int) -> date:
@@ -222,7 +328,7 @@ async def send_reminders(context: ContextTypes.DEFAULT_TYPE) -> None:
         else:
             message = f"У {item['name']} сегодня день рождения! ({item['birthday']})"
 
-        for chat_id in ADMIN_IDS:
+        for chat_id in get_admin_ids():
             await context.bot.send_message(chat_id=chat_id, text=message)
         sent.add(key)
         changed = True
@@ -239,16 +345,14 @@ def parse_reminder_time(value: str) -> time:
 def main() -> None:
     if not os.getenv("BOT_TOKEN"):
         raise RuntimeError("BOT_TOKEN is required")
-    if not ADMIN_IDS:
+    if not get_admin_ids():
         raise RuntimeError("ADMIN_IDS is required")
     ensure_data_file()
 
     application = Application.builder().token(os.environ["BOT_TOKEN"]).build()
     application.add_handler(CommandHandler(["start", "help"], start))
-    application.add_handler(CommandHandler("upload", upload_help))
-    application.add_handler(CommandHandler("export", export_table))
-    application.add_handler(CommandHandler("list", list_birthdays))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.job_queue.run_daily(send_reminders, time=parse_reminder_time(REMINDER_TIME), name="birthday-reminders")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
