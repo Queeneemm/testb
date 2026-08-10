@@ -4,7 +4,7 @@ import os
 import re
 from datetime import date, datetime, time
 from pathlib import Path
-from tempfile import NamedTemporaryFile
+from tempfile import TemporaryDirectory
 from typing import Iterable
 
 from dotenv import load_dotenv
@@ -333,10 +333,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     telegram_file = await document.get_file()
-    with NamedTemporaryFile(suffix=".xlsx") as tmp:
-        await telegram_file.download_to_drive(tmp.name)
+    with TemporaryDirectory() as tmp_dir:
+        tmp_path = Path(tmp_dir) / "upload.xlsx"
+        await telegram_file.download_to_drive(tmp_path)
         try:
-            rows = read_birthdays(Path(tmp.name))
+            rows = read_birthdays(tmp_path)
         except Exception as exc:
             await show_action_menu(update, f"Ошибка: {exc}")
             return
