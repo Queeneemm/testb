@@ -10,8 +10,8 @@ from typing import Iterable
 from dotenv import load_dotenv
 from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Font
-from telegram import Document, ReplyKeyboardMarkup, Update
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import Document, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardRemove, Update
+from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
 from zoneinfo import ZoneInfo
 
 load_dotenv()
@@ -34,15 +34,27 @@ def parse_admin_ids() -> set[int]:
 
 
 ADMIN_IDS = parse_admin_ids()
-MAIN_MENU = ReplyKeyboardMarkup(
+ACTION_UPLOAD = "upload"
+ACTION_EXPORT = "export"
+ACTION_LIST = "list"
+ACTION_ADD_ADMIN = "add_admin"
+ACTION_REMOVE_ADMIN = "remove_admin"
+ACTION_BACK = "back"
+
+MAIN_MENU = InlineKeyboardMarkup(
     [
-        ["Загрузить файл", "Выгрузить файл"],
-        ["Просмотреть таблицу"],
-        ["Добавить админа", "Удалить админа"],
-        ["Главное меню"],
-    ],
-    resize_keyboard=True,
+        [
+            InlineKeyboardButton("Загрузить файл", callback_data=ACTION_UPLOAD),
+            InlineKeyboardButton("Выгрузить файл", callback_data=ACTION_EXPORT),
+        ],
+        [InlineKeyboardButton("Просмотреть таблицу", callback_data=ACTION_LIST)],
+        [
+            InlineKeyboardButton("Добавить админа", callback_data=ACTION_ADD_ADMIN),
+            InlineKeyboardButton("Удалить админа", callback_data=ACTION_REMOVE_ADMIN),
+        ],
+    ]
 )
+BACK_MENU = InlineKeyboardMarkup([[InlineKeyboardButton("Назад", callback_data=ACTION_BACK)]])
 STATE_UPLOAD = "upload"
 STATE_ADD_ADMIN = "add_admin"
 STATE_REMOVE_ADMIN = "remove_admin"
@@ -72,6 +84,10 @@ def set_user_state(context: ContextTypes.DEFAULT_TYPE, state: str | None) -> Non
 
 async def show_main_menu(update: Update, text: str = "Главное меню") -> None:
     await update.effective_message.reply_text(text, reply_markup=MAIN_MENU)
+
+
+async def show_action_menu(update: Update, text: str) -> None:
+    await update.effective_message.reply_text(text, reply_markup=BACK_MENU)
 
 
 def ensure_data_file() -> None:
@@ -174,6 +190,7 @@ MENU_TEXT = "Выберите действие."
 @restricted
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     set_user_state(context, None)
+    await update.effective_message.reply_text("Кнопки перенесены в сообщения бота.", reply_markup=ReplyKeyboardRemove())
     await show_main_menu(update, MENU_TEXT)
 
 
@@ -182,7 +199,7 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     text = (update.effective_message.text or "").strip()
     state = context.user_data.get("state")
 
-    if text == "Главное меню":
+    if text in ("Главное меню", "Назад"):
         set_user_state(context, None)
         await show_main_menu(update)
         return
@@ -197,27 +214,64 @@ async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
 
     if text == "Загрузить файл":
         set_user_state(context, STATE_UPLOAD)
-        await show_main_menu(update, "Загрузите .xlsx файл.")
+        await show_action_menu(update, "Загрузите .xlsx файл.")
     elif text == "Выгрузить файл":
         await export_table(update, context)
     elif text == "Просмотреть таблицу":
         await list_birthdays(update, context)
     elif text == "Добавить админа":
         set_user_state(context, STATE_ADD_ADMIN)
-        await show_main_menu(update, "Введите Telegram ID.")
+        await show_action_menu(update, "Введите Telegram ID.")
     elif text == "Удалить админа":
         set_user_state(context, STATE_REMOVE_ADMIN)
         admins = ", ".join(str(item) for item in sorted(get_admin_ids()))
-        await show_main_menu(update, f"Введите Telegram ID. Сейчас: {admins}")
+        await show_action_menu(update, f"Введите Telegram ID. Сейчас: {admins}")
     else:
         await show_main_menu(update, MENU_TEXT)
+
+
+@restricted
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    action = query.data
+    if action == ACTION_BACK:
+        set_user_state(context, None)
+        await query.edit_message_text("Главное меню", reply_markup=MAIN_MENU)
+        return
+
+    if action == ACTION_UPLOAD:
+        set_user_state(context, STATE_UPLOAD)
+        await query.edit_message_text("Загрузите .xlsx файл.", reply_markup=BACK_MENU)
+    elif action == ACTION_EXPORT:
+        set_user_state(context, None)
+        ensure_data_file()
+        await query.edit_message_text("Выгружаю файл.", reply_markup=BACK_MENU)
+        await update.effective_message.reply_document(document=DATA_FILE.open("rb"), filename="birthdays.xlsx")
+    elif action == ACTION_LIST:
+        set_user_state(context, None)
+        ensure_data_file()
+        rows = read_birthdays()
+        text = "Таблица пустая." if not rows else "\n".join(f"{item['name']} — {item['birthday']}" for item in rows)
+        await query.edit_message_text(text[:4000], reply_markup=BACK_MENU)
+    elif action == ACTION_ADD_ADMIN:
+        set_user_state(context, STATE_ADD_ADMIN)
+        await query.edit_message_text("Введите Telegram ID.", reply_markup=BACK_MENU)
+    elif action == ACTION_REMOVE_ADMIN:
+        set_user_state(context, STATE_REMOVE_ADMIN)
+        admins = ", ".join(str(item) for item in sorted(get_admin_ids()))
+        await query.edit_message_text(f"Введите Telegram ID. Сейчас: {admins}", reply_markup=BACK_MENU)
+    else:
+        set_user_state(context, None)
+        await query.edit_message_text(MENU_TEXT, reply_markup=MAIN_MENU)
 
 
 async def add_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text: str) -> None:
     try:
         admin_id = int(text)
     except ValueError:
-        await show_main_menu(update, "Нужен Telegram ID числом.")
+        await show_action_menu(update, "Нужен Telegram ID числом.")
         return
 
     admin_ids = get_admin_ids()
@@ -231,15 +285,15 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
     try:
         admin_id = int(text)
     except ValueError:
-        await show_main_menu(update, "Нужен Telegram ID числом.")
+        await show_action_menu(update, "Нужен Telegram ID числом.")
         return
 
     admin_ids = get_admin_ids()
     if admin_id not in admin_ids:
-        await show_main_menu(update, f"Админ не найден: {admin_id}")
+        await show_action_menu(update, f"Админ не найден: {admin_id}")
         return
     if len(admin_ids) == 1:
-        await show_main_menu(update, "Нельзя удалить последнего админа.")
+        await show_action_menu(update, "Нельзя удалить последнего админа.")
         return
 
     admin_ids.remove(admin_id)
@@ -252,6 +306,7 @@ async def remove_admin(update: Update, context: ContextTypes.DEFAULT_TYPE, text:
 async def export_table(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     ensure_data_file()
     await update.effective_message.reply_document(document=DATA_FILE.open("rb"), filename="birthdays.xlsx")
+    await update.effective_message.reply_text("Файл выгружен.", reply_markup=BACK_MENU)
 
 
 @restricted
@@ -259,22 +314,22 @@ async def list_birthdays(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     ensure_data_file()
     rows = read_birthdays()
     if not rows:
-        await update.effective_message.reply_text("Таблица пустая.", reply_markup=MAIN_MENU)
+        await update.effective_message.reply_text("Таблица пустая.", reply_markup=BACK_MENU)
         return
     text = "\n".join(f"{item['name']} — {item['birthday']}" for item in rows)
-    await update.effective_message.reply_text(text[:4000], reply_markup=MAIN_MENU)
+    await update.effective_message.reply_text(text[:4000], reply_markup=BACK_MENU)
 
 
 @restricted
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     state = context.user_data.get("state")
     if state != STATE_UPLOAD:
-        await show_main_menu(update, "Нажмите «Загрузить файл».")
+        await show_main_menu(update, "Нажмите «Загрузить файл» в главном меню.")
         return
 
     document: Document = update.effective_message.document
     if not document.file_name.lower().endswith(".xlsx"):
-        await show_main_menu(update, "Нужен .xlsx файл.")
+        await show_action_menu(update, "Нужен .xlsx файл.")
         return
 
     telegram_file = await document.get_file()
@@ -283,7 +338,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         try:
             rows = read_birthdays(Path(tmp.name))
         except Exception as exc:
-            await show_main_menu(update, f"Ошибка: {exc}")
+            await show_action_menu(update, f"Ошибка: {exc}")
             return
     save_birthdays(rows)
     set_user_state(context, None)
@@ -351,6 +406,7 @@ def main() -> None:
 
     application = Application.builder().token(os.environ["BOT_TOKEN"]).build()
     application.add_handler(CommandHandler(["start", "help"], start))
+    application.add_handler(CallbackQueryHandler(handle_button))
     application.add_handler(MessageHandler(filters.Document.ALL, handle_document))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text))
     application.job_queue.run_daily(send_reminders, time=parse_reminder_time(REMINDER_TIME), name="birthday-reminders")
